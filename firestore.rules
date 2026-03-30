@@ -1,0 +1,131 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /**
+     * FIRESTORE SECURITY RULES DOCUMENTATION
+     *
+     * Core Philosophy: 
+     * This ruleset enforces a strict user-ownership model. The security posture is built 
+     * on the principle that all user-generated data is private and accessible only 
+     * by the authenticated creator.
+     *
+     * Data Structure:
+     * All application data is organized hierarchically under the user's unique 
+     * identifier: /users/{userId}/...
+     * This ensures that authorization is inherently linked to the document path, 
+     * making security checks performant and simple to audit.
+     *
+     * Key Security Decisions:
+     * 1. Path-Based Authorization: We rely on the {userId} wildcard in the path 
+     *    to verify ownership against the `request.auth.uid`.
+     * 2. Singleton Management: Entities like 'appUsage' and 'appState' are treated 
+     *    as singletons nested under the user, restricted to that specific user.
+     * 3. Relational Integrity: On document creation, the rules enforce that any 
+     *    internal 'id' fields provided by the client match the Firestore document ID.
+     * 4. Prototyping Flexibility: While authorization is strictly enforced, 
+     *    the internal schema/data types of documents are not validated to allow 
+     *    for rapid frontend iteration.
+     *
+     * Denormalization for Authorization:
+     * No cross-document lookups (get() calls) are required for standard operations 
+     * because ownership is established by the document path itself.
+     */
+
+    // --- Helper Functions ---
+
+    /** @description Checks if the request is from a signed-in user. */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /** @description Checks if the signed-in user's UID matches the provided userId. */
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    /** @description Verifies ownership and ensures the document exists for state-changing operations. */
+    function isExistingOwner(userId) {
+      return resource != null && isOwner(userId);
+    }
+
+    // --- Collection Rules ---
+
+    /**
+     * @description Rules for the user's root document.
+     * @path /users/{userId}
+     * @allow Authenticated user can create/read/update their own profile (create).
+     * @deny Unauthenticated users or different users attempting access.
+     * @principle Self-Creation and Ownership.
+     */
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if isOwner(userId);
+      allow create: if isOwner(userId);
+      allow update: if isExistingOwner(userId);
+      allow delete: if isExistingOwner(userId);
+
+      /**
+       * @description Stores daily AI usage limits for the user to manage freemium access.
+       * @path /users/{userId}/appUsage/appUsage
+       * @allow User updating their own usage count (update).
+       * @deny Public access to a user's usage stats.
+       * @principle Restricts access to a user's own data tree.
+       */
+      match /appUsage/{usageId} {
+        allow get: if isOwner(userId);
+        allow list: if isOwner(userId);
+        allow create: if isOwner(userId) && request.resource.data.id == usageId;
+        allow update: if isExistingOwner(userId) && request.resource.data.id == resource.data.id;
+        allow delete: if isExistingOwner(userId);
+      }
+
+      /**
+       * @description Stores application-wide settings like onboarding flags for the user.
+       * @path /users/{userId}/appState/appState
+       * @allow User checking if they have finished onboarding (get).
+       * @deny Changing onboarding status for another user (update).
+       * @principle Validates relational integrity between path and data.
+       */
+      match /appState/{stateId} {
+        allow get: if isOwner(userId);
+        allow list: if isOwner(userId);
+        allow create: if isOwner(userId) && request.resource.data.id == stateId;
+        allow update: if isExistingOwner(userId) && request.resource.data.id == resource.data.id;
+        allow delete: if isExistingOwner(userId);
+      }
+
+      /**
+       * @description Stores individual AI reply generation sessions (inputs and results).
+       * @path /users/{userId}/replyHistory/{replyHistoryEntryId}
+       * @allow User listing their own past AI generations (list).
+       * @deny A user trying to view another user's generation history.
+       * @principle Ownership-based list and get operations.
+       */
+      match /replyHistory/{replyHistoryEntryId} {
+        allow get: if isOwner(userId);
+        allow list: if isOwner(userId);
+        allow create: if isOwner(userId) && request.resource.data.id == replyHistoryEntryId;
+        allow update: if isExistingOwner(userId) && request.resource.data.id == resource.data.id;
+        allow delete: if isExistingOwner(userId);
+      }
+    }
+
+    /**
+     * @description Stores waitlist entries for users interested in Pro features.
+     * @path /waitlist/{waitlistId}
+     * @allow Any authenticated user to join the waitlist (create).
+     * @deny Public read access to the waitlist.
+     */
+    match /waitlist/{waitlistId} {
+      allow create: if isSignedIn();
+      allow read: if false; // Only admins should read this, but we don't have admin roles yet
+    }
+
+    // --- Global Deny ---
+    // Explicitly deny any access to paths not explicitly defined above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
